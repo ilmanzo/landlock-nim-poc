@@ -42,7 +42,7 @@ suite "Landlock Security Module":
   test "Filesystem Access: Enforcement":
     let code = """
 try:
-  restrictToRead(@[paramStr(2)])
+  discard restrictToRead(@[paramStr(2)])
   echo readFile(paramStr(1)).strip()
 except:
   echo "PERMISSION_DENIED"
@@ -54,7 +54,7 @@ except:
     if getAbiVersion() < 4: skip()
     let code = """
 try:
-  sandbox: allowNet 8080, {BindTcp}
+  discard sandbox: allowNet 8080, {BindTcp}
   var s = newSocket()
   s.bindAddr(Port(8080))
   echo "OK"
@@ -71,7 +71,7 @@ except LandlockError: echo "UNSUPPORTED"
     if getAbiVersion() < 6: skip()
     let code = """
 try:
-  sandbox: scope {Signal}
+  discard sandbox: scope {Signal}
   if kill(getpid(), 0) == 0: echo "SELF_OK"
   if kill(1, 0) == -1: echo "INIT_DENIED"
 except LandlockError: echo "UNSUPPORTED"
@@ -83,7 +83,7 @@ except LandlockError: echo "UNSUPPORTED"
     let code = """
 let target = paramStr(1)
 try:
-  sandbox: allow target, {ReadFile, WriteFile, Truncate}
+  discard sandbox: allow target, {ReadFile, WriteFile, Truncate}
   let f = open(target, fmWrite)
   f.setFilePos(0)
   f.write("truncated")

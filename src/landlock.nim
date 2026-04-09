@@ -230,8 +230,9 @@ proc getBestEffortScopeMask*(abi: int): uint64 =
 proc restrictTo*(allowedPaths: seq[tuple[path: string, flags: set[FsAccess]]] = @[],
                 allowedPorts: seq[tuple[port: uint64, flags: set[NetAccess]]] = @[],
                 scopes: set[Scope] = {},
-                flags: uint32 = 0) =
+                flags: uint32 = 0): Sandboxed =
   ## Restricts the current process to ONLY the provided paths, ports, and scopes.
+  ## Returns a 'Sandboxed' capability on success.
   
   let abi = getAbiVersion()
   if abi == 0:
@@ -294,19 +295,20 @@ proc restrictTo*(allowedPaths: seq[tuple[path: string, flags: set[FsAccess]]] = 
     if landlock_restrict_self(rfd, restrictFlags) < 0:
       raise newException(LandlockError, "Failed to restrict self")
 
+    result = Sandboxed()
+
   finally:
     discard posix.close(rfd.int.int32)
 
 template withSandbox*(allowed: seq[tuple[path: string, flags: set[FsAccess]]], body: untyped) =
   ## Applies a filesystem sandbox and executes the body with a 'Sandboxed' capability.
-  restrictTo(allowedPaths = allowed)
+  let sb {.inject.}: Sandboxed = restrictTo(allowedPaths = allowed)
   block:
-    let sb {.inject.}: Sandboxed = Sandboxed()
     body
 
-proc restrictToRead*(paths: seq[string]) =
+proc restrictToRead*(paths: seq[string]): Sandboxed =
   ## High-level helper for the most common use-case: read-only access.
   var config: seq[tuple[path: string, flags: set[FsAccess]]]
   for p in paths:
     config.add((p, {ReadFile, ReadDir}))
-  restrictTo(allowedPaths = config)
+  return restrictTo(allowedPaths = config)
