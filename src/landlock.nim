@@ -230,7 +230,7 @@ proc getBestEffortScopeMask*(abi: int): uint64 =
 proc restrictTo*(allowedPaths: seq[tuple[path: string, flags: set[FsAccess]]] = @[],
                 allowedPorts: seq[tuple[port: uint64, flags: set[NetAccess]]] = @[],
                 scopes: set[Scope] = {},
-                flags: uint32 = 0): Sandboxed =
+                flags: uint32 = 0): Sandboxed {.discardable.} =
   ## Restricts the current process to ONLY the provided paths, ports, and scopes.
   ## Returns a 'Sandboxed' capability on success.
   
@@ -306,7 +306,7 @@ template withSandbox*(allowed: seq[tuple[path: string, flags: set[FsAccess]]], b
   block:
     body
 
-proc restrictToRead*(paths: seq[string]): Sandboxed =
+proc restrictToRead*(paths: seq[string]): Sandboxed {.discardable.} =
   ## High-level helper for the most common use-case: read-only access.
   var config: seq[tuple[path: string, flags: set[FsAccess]]]
   for p in paths:
