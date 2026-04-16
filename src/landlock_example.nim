@@ -19,11 +19,11 @@ proc main() =
 
   echo "\n--- Applying Sandbox (FS + Net + Scope) ---"
   try:
-    sandbox:
+    discard sandbox:
       allow allowedDir, {ReadFile, ReadDir, WriteFile, MakeReg, MakeDir, RemoveFile, RemoveDir}
       allowNet 443, {ConnectTcp}
       scope {Signal}
-    
+
     echo "Sandbox applied successfully!"
   except LandlockError as e:
     echo "Failed to apply sandbox: ", e.msg

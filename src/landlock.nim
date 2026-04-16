@@ -1,7 +1,7 @@
 ## Idiomatic Nim wrapper for the Linux Landlock LSM (Linux Security Module).
 ## Provides high-level, safe, and portable filesystem and network sandboxing for Nim applications.
 
-import os, posix, macros
+import os, posix, macros, options
 
 when not defined(linux):
   {.error: "Landlock is only supported on Linux.".}
@@ -78,6 +78,9 @@ type
     port: uint64
 
   RulesetFd = distinct int32
+    ## Internal file descriptor wrapper for landlock rulesets.
+    ## NOT exported - must be managed internally to prevent FD leaks.
+    ## Users should use the high-level restrictTo/sandbox APIs instead.
 
 proc syscall(number: int): int {.importc, header: "<unistd.h>", varargs.}
 
@@ -95,23 +98,67 @@ proc setNoNewPrivs(): int =
 
 # --- High-Level API ---
 
+const
+  LandlockWrapperVersion* = "0.1.0"
+    ## Version of this Nim wrapper library.
+    ## This is distinct from the kernel's Landlock ABI version.
+
 type
   LandlockError* = object of OSError
     ## Base exception for Landlock-specific failures.
 
   FsAccess* = enum
     ## Available filesystem operations to restrict or allow.
-    Execute, WriteFile, ReadFile, ReadDir, RemoveDir, RemoveFile,
-    MakeChar, MakeDir, MakeReg, MakeSock, MakeFifo, MakeBlock,
-    MakeSym, Refer, Truncate, IoctlDev
+    ##
+    ## Use these flags in sets to specify what filesystem operations
+    ## are permitted on a given path. For example:
+    ##   {ReadFile, ReadDir} for read-only access
+    ##   {WriteFile, MakeReg} for creating and writing files
+    Execute         ## Execute files (requires read access to directory)
+    WriteFile       ## Modify existing files
+    ReadFile        ## Read file contents
+    ReadDir         ## List directory contents
+    RemoveDir       ## Delete directories
+    RemoveFile      ## Delete files
+    MakeChar        ## Create character devices
+    MakeDir         ## Create directories
+    MakeReg         ## Create regular files
+    MakeSock        ## Create Unix sockets
+    MakeFifo        ## Create named pipes
+    MakeBlock       ## Create block devices
+    MakeSym         ## Create symbolic links
+    Refer           ## Link/rename across directories (ABI v2+)
+    Truncate        ## Truncate files (ABI v3+)
+    IoctlDev        ## IOCTL on devices (ABI v5+)
 
   NetAccess* = enum
     ## Available network operations (TCP).
-    BindTcp, ConnectTcp
+    ##
+    ## Network sandboxing requires ABI v4+.
+    ## Use these flags to control TCP networking:
+    ##   {BindTcp} to allow binding server sockets
+    ##   {ConnectTcp} to allow outbound connections
+    BindTcp         ## Bind TCP sockets to ports (server operation)
+    ConnectTcp      ## Connect TCP sockets (client operation)
 
   Scope* = enum
     ## Scoping restrictions for IPC and sockets.
-    AbstractUnixSocket, Signal
+    ##
+    ## Scoping requires ABI v6+.
+    ## Controls inter-process communication restrictions:
+    ##   AbstractUnixSocket - restrict abstract Unix socket access
+    ##   Signal - restrict signal sending to other processes
+    AbstractUnixSocket  ## Restrict abstract Unix socket namespace access (ABI v6+)
+    Signal              ## Restrict sending signals to other processes (ABI v6+)
+
+  RestrictFlag* = enum
+    ## Flags for landlock_restrict_self() behavior.
+    ## ABI v7+: LogSameExecOff, LogNewExecOn, LogSubdomainsOff
+    ## ABI v8+: TSync
+    LogSameExecOff    ## Disable logging for same-exec transitions
+    LogNewExecOn      ## Enable logging for new-exec transitions
+    LogSubdomainsOff  ## Disable logging for subdomain transitions
+    TSync             ## Sync restrictions across all threads (ABI v8+)
 
 const
   FsAccessMap: array[FsAccess, uint64] = [
@@ -143,7 +190,12 @@ const
     Signal:             LANDLOCK_SCOPE_SIGNAL
   ]
 
-type Access* = FsAccess # Legacy alias
+  RestrictFlagMap: array[RestrictFlag, uint32] = [
+    LogSameExecOff:   LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF,
+    LogNewExecOn:     LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON,
+    LogSubdomainsOff: LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF,
+    TSync:            LANDLOCK_RESTRICT_SELF_TSYNC
+  ]
 
 template toLandlock[T: enum](s: set[T], mask: uint64, mapping: array[T, uint64]): uint64 =
   var res: uint64 = 0
@@ -151,20 +203,50 @@ template toLandlock[T: enum](s: set[T], mask: uint64, mapping: array[T, uint64])
     res = res or (mapping[a] and mask)
   res
 
+func toRestrictFlags(s: set[RestrictFlag], abi: int): uint32 =
+  ## Convert RestrictFlag set to uint32, filtering by ABI version.
+  ## Pure function with no side effects.
+  result = 0'u32
+  for flag in s:
+    # TSync is only available in ABI v8+
+    if flag == TSync and abi < 8:
+      continue
+    result = result or RestrictFlagMap[flag]
+
 macro sandbox*(body: untyped): untyped =
   ## Declarative DSL for sandboxing.
-  ## Transforms a block of 'allow', 'allowNet', and 'scope' statements into a Landlock ruleset.
-  let 
+  ##
+  ## Transforms a block of 'allow', 'allowNet', and 'scope' statements
+  ## into a Landlock ruleset. This is the recommended high-level API.
+  ##
+  ## Returns a Sandboxed capability that must be captured or explicitly discarded.
+  ##
+  ## Commands:
+  ##   allow <path>, {<FsAccess flags>}      - Allow filesystem operations
+  ##   allowNet <port>, {<NetAccess flags>}  - Allow network operations (ABI v4+)
+  ##   scope {<Scope flags>}                 - Add IPC restrictions (ABI v6+)
+  ##
+  ## Example:
+  ##   discard sandbox:
+  ##     allow "/tmp", {ReadFile, WriteFile, MakeReg}
+  ##     allow "/home/user/data", {ReadFile, ReadDir}
+  ##     allowNet 443, {ConnectTcp}
+  ##     scope {Signal}
+  ##
+  ##   # Process is now restricted
+  ##   writeFile("/tmp/safe.txt", "OK")  # Works
+  ##   writeFile("/etc/bad", "NO")       # Denied by kernel
+  let
     allowedPaths = genSym(nskVar, "allowedPaths")
     allowedPorts = genSym(nskVar, "allowedPorts")
     scopeSet = genSym(nskVar, "scopeSet")
-  
-  result = newStmtList()
-  result.add quote do:
+
+  var stmts = newStmtList()
+  stmts.add quote do:
     var `allowedPaths`: seq[tuple[path: string, flags: set[FsAccess]]] = @[]
     var `allowedPorts`: seq[tuple[port: uint64, flags: set[NetAccess]]] = @[]
     var `scopeSet`: set[Scope] = {}
-  
+
   for node in body:
     case node.kind:
     of nnkCall, nnkCommand:
@@ -173,33 +255,99 @@ macro sandbox*(body: untyped): untyped =
       of "allow":
         if node.len != 3: error("allow command expects 2 arguments: path and access set", node)
         let (path, access) = (node[1], node[2])
-        result.add quote do: `allowedPaths`.add((`path`, `access`))
+        stmts.add quote do: `allowedPaths`.add((`path`, `access`))
       of "allowNet":
         if node.len != 3: error("allowNet command expects 2 arguments: port and access set", node)
         let (port, access) = (node[1], node[2])
-        result.add quote do: `allowedPorts`.add((`port`.uint64, `access`))
+        stmts.add quote do: `allowedPorts`.add((`port`.uint64, `access`))
       of "scope":
         if node.len != 2: error("scope command expects 1 argument: scope set", node)
         let s = node[1]
-        result.add quote do: `scopeSet` = `scopeSet` + `s`
+        stmts.add quote do: `scopeSet` = `scopeSet` + `s`
       else:
         error("Unknown sandbox command: " & cmd, node)
     of nnkEmpty: discard
     else: error("Unexpected node in sandbox block: " & node.repr, node)
-      
-  result.add quote do:
-    restrictTo(`allowedPaths`, `allowedPorts`, `scopeSet`)
+
+  # Return the Sandboxed capability from restrictTo
+  result = quote do:
+    block:
+      `stmts`
+      restrictTo(`allowedPaths`, `allowedPorts`, `scopeSet`)
 
 macro toStaticLandlock*(s: static set[FsAccess]): uint64 =
   ## Computes the Landlock bitmask at compile-time.
+  ##
+  ## Useful for verifying flag combinations or testing.
+  ## Normal usage should prefer the high-level APIs.
+  ##
+  ## Example:
+  ##   const ReadMask = toStaticLandlock({ReadFile, ReadDir})
+  ##   # ReadMask == 12'u64
   var mask: uint64 = 0
   for a in s:
     mask = mask or FsAccessMap[a]
   result = newLit(mask)
 
-type 
+type
   Sandboxed* = object
     ## A capability type representing a sandboxed state.
+    ##
+    ## This is returned by restrictTo(), sandbox:, and helper functions
+    ## when sandboxing succeeds. Functions can require this type as a parameter
+    ## to ensure they only run within a sandbox.
+    ##
+    ## Example:
+    ##   proc dangerousOp(proof: Sandboxed) =
+    ##     # Can only be called when sandboxed
+    ##     ...
+    ##
+    ##   let sb = restrictToRead(@["/tmp"])
+    ##   dangerousOp(sb)  # OK - we have proof
+    ##   # dangerousOp(???)  # Compiler error - no proof
+
+  SandboxPolicy* = object
+    ## Builder type for constructing Landlock policies.
+    ##
+    ## Provides a fluent API for configuring sandbox restrictions
+    ## before applying them. Recommended for complex policies.
+    ##
+    ## Example:
+    ##   var policy = newSandboxPolicy()
+    ##   policy.allowPath("/tmp", {ReadFile, WriteFile})
+    ##         .allowPath("/home/user", {ReadFile})
+    ##         .allowPort(443, {ConnectTcp})
+    ##
+    ##   let errors = policy.validate()
+    ##   if errors.len == 0:
+    ##     discard policy.apply()
+    paths: seq[tuple[path: string, flags: set[FsAccess]]]
+    ports: seq[tuple[port: uint64, flags: set[NetAccess]]]
+    scopes: set[Scope]
+    restrictFlags: set[RestrictFlag]
+
+var
+  gSandboxApplied {.threadvar.}: bool
+    ## Thread-local flag tracking whether sandboxing has been applied.
+    ## Used by isSandboxed() for introspection.
+
+proc isSandboxed*(): bool =
+  ## Returns true if this thread has applied Landlock restrictions.
+  ##
+  ## Note: This tracks only restrictions applied via this library.
+  ## It does not detect restrictions inherited from parent processes
+  ## or applied through other means.
+  return gSandboxApplied
+
+proc getSandboxedCapability*(): Option[Sandboxed] =
+  ## Returns a Sandboxed capability if this thread has been sandboxed.
+  ##
+  ## This allows obtaining a capability token after sandboxing,
+  ## useful when the original token was discarded.
+  if gSandboxApplied:
+    return some(Sandboxed())
+  else:
+    return none(Sandboxed)
 
 proc getAbiVersion*(): int =
   ## Returns the Landlock ABI version supported by the kernel.
@@ -207,7 +355,9 @@ proc getAbiVersion*(): int =
   if res < 0: return 0
   return res
 
-proc getBestEffortFsMask*(abi: int): uint64 =
+func getBestEffortFsMask*(abi: int): uint64 =
+  ## Returns filesystem access flags supported by the given ABI version.
+  ## Pure function with no side effects.
   result = LANDLOCK_ACCESS_FS_EXECUTE or LANDLOCK_ACCESS_FS_WRITE_FILE or
            LANDLOCK_ACCESS_FS_READ_FILE or LANDLOCK_ACCESS_FS_READ_DIR or
            LANDLOCK_ACCESS_FS_REMOVE_DIR or LANDLOCK_ACCESS_FS_REMOVE_FILE or
@@ -219,21 +369,138 @@ proc getBestEffortFsMask*(abi: int): uint64 =
   if abi >= 3: result = result or LANDLOCK_ACCESS_FS_TRUNCATE
   if abi >= 5: result = result or LANDLOCK_ACCESS_FS_IOCTL_DEV
 
-proc getBestEffortNetMask*(abi: int): uint64 =
+func getBestEffortNetMask*(abi: int): uint64 =
+  ## Returns network access flags supported by the given ABI version.
+  ## Pure function with no side effects.
   if abi >= 4:
     result = LANDLOCK_ACCESS_NET_BIND_TCP or LANDLOCK_ACCESS_NET_CONNECT_TCP
 
-proc getBestEffortScopeMask*(abi: int): uint64 =
+func getBestEffortScopeMask*(abi: int): uint64 =
+  ## Returns scoping flags supported by the given ABI version.
+  ## Pure function with no side effects.
   if abi >= 6:
     result = LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET or LANDLOCK_SCOPE_SIGNAL
+
+# Forward declaration for builder pattern
+proc restrictTo*(allowedPaths: seq[tuple[path: string, flags: set[FsAccess]]] = @[],
+                allowedPorts: seq[tuple[port: uint64, flags: set[NetAccess]]] = @[],
+                scopes: set[Scope] = {},
+                restrictFlags: set[RestrictFlag] = {}): Sandboxed
+
+# --- Builder Pattern API ---
+
+proc newSandboxPolicy*(): SandboxPolicy =
+  ## Creates a new empty sandbox policy.
+  ##
+  ## Use the builder methods to configure the policy, then call apply() to enforce it.
+  ##
+  ## Example:
+  ##   let sb = newSandboxPolicy()
+  ##     .allowPath("/tmp", {ReadFile, WriteFile})
+  ##     .allowPort(443, {ConnectTcp})
+  ##     .apply()
+  result = SandboxPolicy(
+    paths: @[],
+    ports: @[],
+    scopes: {},
+    restrictFlags: {}
+  )
+
+proc allowPath*(policy: var SandboxPolicy, path: string, flags: set[FsAccess]): var SandboxPolicy {.discardable.} =
+  ## Add a filesystem path with the given access permissions.
+  ## Returns the policy for method chaining.
+  policy.paths.add((path, flags))
+  return policy
+
+proc allowPort*(policy: var SandboxPolicy, port: uint64, flags: set[NetAccess]): var SandboxPolicy {.discardable.} =
+  ## Add a network port with the given access permissions.
+  ## Returns the policy for method chaining.
+  policy.ports.add((port, flags))
+  return policy
+
+proc addScope*(policy: var SandboxPolicy, scope: Scope): var SandboxPolicy {.discardable.} =
+  ## Add a single scoping restriction.
+  ## Returns the policy for method chaining.
+  policy.scopes.incl(scope)
+  return policy
+
+proc addScopes*(policy: var SandboxPolicy, scopes: set[Scope]): var SandboxPolicy {.discardable.} =
+  ## Add multiple scoping restrictions.
+  ## Returns the policy for method chaining.
+  policy.scopes = policy.scopes + scopes
+  return policy
+
+proc setRestrictFlags*(policy: var SandboxPolicy, flags: set[RestrictFlag]): var SandboxPolicy {.discardable.} =
+  ## Set landlock_restrict_self() behavior flags.
+  ## Returns the policy for method chaining.
+  policy.restrictFlags = flags
+  return policy
+
+proc validate*(policy: SandboxPolicy): seq[string] =
+  ## Validates the policy without applying it.
+  ## Returns a sequence of error messages. Empty sequence means the policy is valid.
+  ##
+  ## Checks:
+  ## - Paths are absolute
+  ## - Paths exist and are accessible
+  ## - Ports are in valid range (1-65535)
+  ##
+  ## Example:
+  ##   let errors = policy.validate()
+  ##   if errors.len > 0:
+  ##     for err in errors: echo "Validation error: ", err
+  result = @[]
+
+  # Validate filesystem paths
+  for item in policy.paths:
+    # Check if path is absolute
+    if not isAbsolute(item.path):
+      result.add("Path must be absolute: " & item.path)
+      continue  # Skip existence check if path is not absolute
+
+    # Check if path exists
+    if not fileExists(item.path) and not dirExists(item.path):
+      result.add("Path does not exist: " & item.path)
+
+  # Validate network ports
+  for item in policy.ports:
+    if item.port == 0 or item.port > 65535:
+      result.add("Port must be in range 1-65535: " & $item.port)
+
+proc apply*(policy: SandboxPolicy): Sandboxed =
+  ## Apply the configured sandbox policy to the current process.
+  ## Returns a Sandboxed capability on success.
+  return restrictTo(
+    allowedPaths = policy.paths,
+    allowedPorts = policy.ports,
+    scopes = policy.scopes,
+    restrictFlags = policy.restrictFlags
+  )
 
 proc restrictTo*(allowedPaths: seq[tuple[path: string, flags: set[FsAccess]]] = @[],
                 allowedPorts: seq[tuple[port: uint64, flags: set[NetAccess]]] = @[],
                 scopes: set[Scope] = {},
-                flags: uint32 = 0): Sandboxed {.discardable.} =
+                restrictFlags: set[RestrictFlag] = {}): Sandboxed =
   ## Restricts the current process to ONLY the provided paths, ports, and scopes.
   ## Returns a 'Sandboxed' capability on success.
-  
+  ##
+  ## All paths must be absolute. Relative paths will be rejected.
+  ## Paths are canonicalized (symlinks resolved, '..' normalized) before use.
+  ##
+  ## The restrictFlags parameter controls landlock_restrict_self() behavior.
+  ## Unsupported flags for the current ABI version are automatically filtered.
+  ##
+  ## Note: The return value must be captured or explicitly discarded.
+  ## This enforces awareness that sandboxing has been applied.
+
+  # Validate and canonicalize paths
+  var canonicalPaths: seq[tuple[path: string, flags: set[FsAccess]]]
+  for item in allowedPaths:
+    if not isAbsolute(item.path):
+      raise newException(LandlockError, "Path must be absolute: " & item.path)
+    let canonical = absolutePath(item.path)
+    canonicalPaths.add((canonical, item.flags))
+
   let abi = getAbiVersion()
   if abi == 0:
     raise newException(LandlockError, "Landlock is not supported or enabled on this kernel.")
@@ -260,8 +527,7 @@ proc restrictTo*(allowedPaths: seq[tuple[path: string, flags: set[FsAccess]]] = 
 
   try:
     # 2. Add FS Rules
-    for item in allowedPaths:
-      const O_PATH = 0x200000 
+    for item in canonicalPaths:
       let fd = posix.open(item.path.cstring, O_PATH or O_CLOEXEC)
       if fd < 0:
         raise newException(LandlockError, "Failed to open path for rule: " & item.path)
@@ -289,12 +555,13 @@ proc restrictTo*(allowedPaths: seq[tuple[path: string, flags: set[FsAccess]]] = 
     if setNoNewPrivs() < 0:
       raise newException(LandlockError, "Failed to set PR_SET_NO_NEW_PRIVS")
 
-    var restrictFlags = flags
-    if abi < 8: restrictFlags = restrictFlags and (not LANDLOCK_RESTRICT_SELF_TSYNC)
-    
-    if landlock_restrict_self(rfd, restrictFlags) < 0:
+    let flags = toRestrictFlags(restrictFlags, abi)
+
+    if landlock_restrict_self(rfd, flags) < 0:
       raise newException(LandlockError, "Failed to restrict self")
 
+    # Mark this thread as sandboxed for introspection
+    gSandboxApplied = true
     result = Sandboxed()
 
   finally:
@@ -302,13 +569,44 @@ proc restrictTo*(allowedPaths: seq[tuple[path: string, flags: set[FsAccess]]] = 
 
 template withSandbox*(allowed: seq[tuple[path: string, flags: set[FsAccess]]], body: untyped) =
   ## Applies a filesystem sandbox and executes the body with a 'Sandboxed' capability.
+  ##
+  ## The sandboxed capability is injected as `sb` for use in the body.
+  ## This template is useful for scoping sandbox restrictions to a code block.
+  ##
+  ## Example:
+  ##   withSandbox @[("/tmp", {ReadFile, WriteFile})]:
+  ##     # sb is available here as the Sandboxed proof
+  ##     writeFile("/tmp/test.txt", "data")
+  ##     # Restricted to /tmp only
   let sb {.inject.}: Sandboxed = restrictTo(allowedPaths = allowed)
   block:
     body
 
-proc restrictToRead*(paths: seq[string]): Sandboxed {.discardable.} =
-  ## High-level helper for the most common use-case: read-only access.
+proc restrictToRead*(paths: seq[string]): Sandboxed =
+  ## High-level helper for the most common use-case: read-only access to multiple paths.
+  ##
+  ## Note: The return value must be captured or explicitly discarded.
+  ## This enforces awareness that sandboxing has been applied.
   var config: seq[tuple[path: string, flags: set[FsAccess]]]
   for p in paths:
     config.add((p, {ReadFile, ReadDir}))
   return restrictTo(allowedPaths = config)
+
+proc restrictToDir*(dir: string, flags: set[FsAccess]): Sandboxed =
+  ## Restrict to a single directory tree with specified permissions.
+  ##
+  ## Common use case: sandbox a process to work within one directory.
+  ## All subdirectories inherit the same permissions.
+  ##
+  ## Note: The return value must be captured or explicitly discarded.
+  ## This enforces awareness that sandboxing has been applied.
+  return restrictTo(allowedPaths = @[(dir, flags)])
+
+proc restrictToNetworkOnly*(ports: seq[tuple[port: uint64, flags: set[NetAccess]]]): Sandboxed =
+  ## Restrict to network-only access with no filesystem permissions.
+  ##
+  ## Common use case: network proxies, API clients, services that only need network.
+  ##
+  ## Note: The return value must be captured or explicitly discarded.
+  ## This enforces awareness that sandboxing has been applied.
+  return restrictTo(allowedPaths = @[], allowedPorts = ports)

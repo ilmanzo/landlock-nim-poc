@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nimble test *)",
+      "Bash(nim *)",
+      "Bash(nimble example *)"
+    ]
+  }
+}
